@@ -1,6 +1,7 @@
 import path from 'node:path'
 import { URL } from 'node:url'
 import type {
+  GetModuleInfo,
   OutputAsset,
   OutputBundle,
   OutputChunk,
@@ -47,7 +48,7 @@ import {
   publicAssetUrlRE,
   urlToBuiltUrl,
 } from './asset'
-import { cssBundleNameCache } from './css'
+import { cssBundleNameCache, cssModuleFileMapCache } from './css'
 import { modulePreloadPolyfillId } from './modulePreloadPolyfill'
 
 interface ScriptAssetsUrl {
@@ -819,40 +820,98 @@ export function buildHtmlPlugin(config: ResolvedConfig): Plugin {
         },
       })
 
-      const getCssFilesForChunk = (
-        chunk: OutputChunk,
-        seenChunks: Set<string> = new Set(),
-        seenCss: Set<string> = new Set(),
-      ): string[] => {
-        if (seenChunks.has(chunk.fileName)) {
-          return []
+      const cssModuleFileMap = cssModuleFileMapCache.get(config)
+      const getModuleInfo: GetModuleInfo = (id) => this.getModuleInfo(id)
+      // Collects CSS files needed by an entry chunk, ordered by the
+      // source-import position of the CSS modules that produced them.
+      //
+      // The previous implementation walked `chunk.imports` post-order and
+      // appended each chunk's `viteMetadata.importedCss` in iteration order.
+      // Both of those orderings are derived from Rollup's chunking and do
+      // not match the order in which the application's source code actually
+      // imports the CSS — so the resulting `<link>` tags could load in the
+      // wrong cascade order (see #4890).
+      //
+      // Instead, walk the module graph from the entry chunk's facade module
+      // in DFS source-import order. Each CSS module's emitted file (looked
+      // up in `cssModuleFileMap`) is registered at the position in the
+      // walk where its importing module references it. Post-order DFS
+      // means dependencies' CSS is loaded first, matching the existing
+      // "dependencies-first" cascade behavior.
+      //
+      // Falls back to the chunk-import post-order walk for any CSS files
+      // that aren't reached via the module graph (e.g., CSS-only chunks
+      // with no facade-reachable module, or implicit Rollup imports).
+      const getCssFilesForChunk = (entryChunk: OutputChunk): string[] => {
+        if (analyzedImportedCssFiles.has(entryChunk)) {
+          return analyzedImportedCssFiles.get(entryChunk)!
         }
-        seenChunks.add(chunk.fileName)
 
-        if (analyzedImportedCssFiles.has(chunk)) {
-          const files = analyzedImportedCssFiles.get(chunk)!
-          const additionals = files.filter((file) => !seenCss.has(file))
-          additionals.forEach((file) => seenCss.add(file))
-          return additionals
-        }
+        const result: string[] = []
+        const seenCss = new Set<string>()
+        const visitedModules = new Set<string>()
 
-        const files: string[] = []
-        chunk.imports.forEach((file) => {
-          const importee = bundle[file]
-          if (importee?.type === 'chunk') {
-            files.push(...getCssFilesForChunk(importee, seenChunks, seenCss))
-          }
-        })
-        analyzedImportedCssFiles.set(chunk, files)
-
-        chunk.viteMetadata!.importedCss.forEach((file) => {
+        const addCssFile = (file: string) => {
           if (!seenCss.has(file)) {
             seenCss.add(file)
-            files.push(file)
+            result.push(file)
           }
-        })
+        }
 
-        return files
+        // DFS the module graph in source-import order. Post-order — register
+        // a module's CSS file after walking its imports — so dependencies'
+        // CSS comes first (preserves the existing cascade priority).
+        const walkModule = (id: string) => {
+          if (visitedModules.has(id)) return
+          visitedModules.add(id)
+
+          const info = getModuleInfo(id)
+          if (info) {
+            for (const importedId of info.importedIds) {
+              walkModule(importedId)
+            }
+          }
+
+          const cssFile = cssModuleFileMap!.get(id)
+          if (cssFile !== undefined) addCssFile(cssFile)
+        }
+
+        if (cssModuleFileMap) {
+          if (entryChunk.facadeModuleId) {
+            walkModule(entryChunk.facadeModuleId)
+          }
+          // Cover modules in the chunk that aren't reached from the facade
+          // (e.g., side-effect-only auto-injected modules, or chunks
+          // without a facade).
+          if (entryChunk.modules) {
+            for (const id of Object.keys(entryChunk.modules)) {
+              walkModule(id)
+            }
+          }
+        }
+
+        // Fallback for CSS files that aren't associated with any walked
+        // module — e.g., chunks introduced via implicit Rollup edges, or
+        // when the css-module map is unavailable. Post-order chunk
+        // traversal preserves the previous behavior for these.
+        const visitedChunks = new Set<OutputChunk>()
+        const walkChunkPostOrder = (chunk: OutputChunk) => {
+          if (visitedChunks.has(chunk)) return
+          visitedChunks.add(chunk)
+          for (const file of chunk.imports) {
+            const imp = bundle[file]
+            if (imp?.type === 'chunk') walkChunkPostOrder(imp)
+          }
+          if (chunk.viteMetadata?.importedCss) {
+            for (const file of chunk.viteMetadata.importedCss) {
+              addCssFile(file)
+            }
+          }
+        }
+        walkChunkPostOrder(entryChunk)
+
+        analyzedImportedCssFiles.set(entryChunk, result)
+        return result
       }
 
       const getCssTagsForChunk = (
